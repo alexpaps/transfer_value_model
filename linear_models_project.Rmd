@@ -1,0 +1,723 @@
+---
+title: "Footballers' Market Value"
+author: "Alexandros Papadopoulos"
+date: "2025-11-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+rm(list = ls())
+players_data = read.csv("players_22.csv")
+```
+
+## First Chapter
+## Data Analysis
+Part(i)
+```{r}
+names(data)
+
+# Keep the necessary columns
+players_data = players_data[, c(
+  "short_name",
+  "player_positions",
+  "age",
+  "value_eur",
+  "wage_eur",
+  "height_cm",
+  "weight_kg",
+  "club_name",
+  "league_name",
+  "club_joined",
+  "club_contract_valid_until",
+  "nationality_name",
+  "preferred_foot",
+  "release_clause_eur",
+  "club_position",
+  "nation_position",
+  "weak_foot",
+  "work_rate",
+  "international_reputation"
+)]
+
+
+# Rename the columns
+names(players_data) = c(
+  "Name", "Player_Positions", "Age", "Value_EUR", "Wage_EUR", "Height_cm", "Weight_kg",
+  "Club_Name", "League_Name", "Club_Joined", "Contract_Valid_Until",
+  "Nationality", "Preferred_Foot", "Release_Clause_EUR",
+  "Club_Position", "Nation_Position", "Weak_Foot", "Work_Rate",
+  "International_Reputation"
+)
+```
+## Convert positions into numeric codes
+Part(ii)
+```{r}
+
+# Get the first option as the main position
+players_data$Player_Positions = sapply(strsplit(players_data$Player_Positions , ",\\s*"), `[`, 1)
+
+# Function to map position to numeric category
+position_to_num <- function(pos) {
+  if (pos == "GK") {
+    return(1)  # Goalkeeper
+  } else if (pos %in% c("CB","RB","LB","RWB","LWB")) {
+    return(2)  # Defender
+  } else if (pos %in% c("CDM","RDM","LDM","CM","LCM","RCM","CAM","LAM","RAM","LM","RM")) {
+    return(3)  # Midfielder
+  } else if (pos %in% c("ST","CF","LW","RW","LF","RF")) {
+    return(4)  # Forward
+  } else {
+    return(NA) # Unknown or undefined
+  }
+}
+
+# Replace the original column directly with numeric codes
+players_data$Player_Positions <- sapply(players_data$Player_Positions, position_to_num)
+
+# Now the column itself is numeric
+head(players_data[, "Player_Positions"])
+
+
+```
+## Convert Nation names into numeric codes
+Part(iii)
+```{r}
+
+# Get the FIFA official rankings
+fifa_rankings_data = read.csv("fifa_ranking-2024-04-04.csv")
+
+# Convert the rank_date column to Date type if it isn't already
+fifa_rankings_data$rank_date = as.Date(fifa_rankings_data$rank_date)
+
+# Keep only rows for 2021-08-12
+# Keep only the August update, as FIFA(the game) is released around this time
+fifa_rankings_data <- subset(fifa_rankings_data, rank_date == as.Date("2021-08-12"))
+
+# Keep the necessary columns and rename them
+fifa_rankings_data = fifa_rankings_data[, c("rank", "country_full", "confederation")]
+names(fifa_rankings_data) = c("Rank", "Country", "Confederation")
+
+
+# # Create a mapping vector
+# confederation_map <- c(
+#   "CAF" = "Africa",
+#   "OFC" = "Oceania",
+#   "CONCACAF" = "North America",
+#   "UEFA" = "Europe",
+#   "AFC" = "Asia",
+#   "CONMEBOL" = "South America"
+# )
+# Create a mapping vector
+confederation_map <- c(
+  "CAF" = 4,
+  "OFC" = 6,
+  "CONCACAF" = 3,
+  "UEFA" = 1, 
+  "AFC" = 5, 
+  "CONMEBOL" = 2
+)
+
+# Apply the mapping to create a new column
+fifa_rankings_data$Confederation <- confederation_map[fifa_rankings_data$Confederation]
+names(fifa_rankings_data) = c("Rank", "Country", "Continent")
+
+unique(fifa_rankings_data$Continent)
+
+# Create a named vector: ranking -> continent
+continent_map <- setNames(fifa_rankings_data$Continent, fifa_rankings_data$Country)
+
+
+# Add continent column to your main dataset
+players_data$Continent <- continent_map[players_data$Nationality]
+
+# Check
+head(players_data[, c("Nationality", "Continent")])
+
+
+# Create a named vector: country -> ranking
+rank_map <- setNames(fifa_rankings_data$Rank, fifa_rankings_data$Country)
+
+# Replace Nationality column with ranking points
+players_data$Nationality <- rank_map[players_data$Nationality]
+
+# Check
+head(players_data[, "Nationality"])
+
+
+
+```
+
+## Convert Clubs into numbers
+Part(iv)
+```{r}
+
+club_data = read.csv("Soccer_Football Clubs Ranking.csv")
+names(club_data)
+club_data = club_data[,c("ranking", "club.name")]
+names(club_data) = c("Rank", "Club")
+
+
+# -----------------------------
+# Problem:
+# The main player dataset (`data`) and the club rankings dataset (`club_data`)
+# have slightly different club names. For example, "FC Bayern Munich" vs "Bayern Munich".
+# A direct lookup using names would fail and produce NAs.
+# -----------------------------
+
+# -----------------------------
+# Solution:
+# 1. Identify all unique club names in the main dataset.
+# 2. For each club, find the most similar name in the rankings dataset using string distance (Jaro-Winkler method).
+# 3. Store the matched club name and its ranking in a mapping table.
+# 4. Apply this mapping table to the main dataset so that each player receives the correct club ranking.
+# -----------------------------
+
+# Benefits:
+# - Handles minor differences in club names automatically.
+# - Avoids repeated fuzzy matching for every player (only done once per unique club).
+# - Ensures consistency: every player from the same club gets the same ranking.
+# -----------------------------
+
+# Optional note:
+# You could add a threshold on string distance to catch mismatches (e.g., if closest match is too dissimilar, assign NA).
+
+library(stringdist)
+library(dplyr)
+
+# Prepare vectors
+data_clubs <- unique(players_data$Club_Name)        # all clubs in your main data
+club_list <- club_data$Club                 # clubs in ranking data
+club_ranks <- setNames(club_data$Rank, club_data$Club)
+
+# Function to find best match
+get_best_match <- function(club) {
+  distances <- stringdist(tolower(club), tolower(club_list), method = "jw")  # Jaro-Winkler
+  best_match <- club_list[which.min(distances)]
+  return(best_match)
+}
+
+# Create mapping table: Data club -> Closest club in ranking data
+mapping <- data.frame(
+  Club_Name = data_clubs,
+  Closest_Club = sapply(data_clubs, get_best_match),
+  stringsAsFactors = FALSE
+)
+
+# Add the ranking for each matched club
+mapping$Club_Ranking <- club_ranks[mapping$Closest_Club]
+
+# Check mapping table
+head(mapping)
+
+# Now apply mapping to the main dataset
+players_data <- players_data %>%
+  left_join(mapping[, c("Club_Name", "Club_Ranking")], by = "Club_Name")
+
+# Check final result
+head(players_data[, c("Club_Name", "Club_Ranking")])
+
+
+
+```
+
+
+## Convert league names into numeric codes
+Part(v)(a) # Scrape this website to get the league standing information
+```{r}
+
+# Convert league names into numeric codes
+unique(players_data$League_Name)
+
+library(rvest)
+library(dplyr)
+library(readr)
+
+url <- "https://www.kickalgor.com/football-leagues/the-ka-football-leagues-global-rating-for-2021-22-season/the-ka-football-leagues-global-rating-for-2021-22-opening-year-2022-data-table/?utm_source=chatgpt.com"
+
+page <- read_html(url)
+tables <- html_table(page, fill = TRUE)
+
+league_data <- tables[[1]]
+
+# Select the correct columns
+# Suppose your dataframe is df
+league_data <- league_data[, c("Pos", "Country", "LEAGUE")]
+
+
+# Save as CSV
+write_csv(league_data, "league_rankings_2022.csv")
+
+head(league_data)
+
+names(league_data) = c("Rank", "Country", "League")
+
+
+
+```
+
+# ---------------------------------------------
+# The original file `league_rankings_2022.csv` contained league names
+# in mixed formats or languages. To ensure compatibility with the main dataset,
+# we translated and standardized all league names into English,
+# saving the result as `league_rankings_2022_renamed_english.csv`.
+
+# After translation, we verified that the league names in both datasets 
+# (the player dataset and the league rankings dataset) matched correctly.
+# Once the names were consistent, we saved the finalized and aligned version 
+# as `league_rankings_2022_corrected.csv`.
+# This corrected file is now used for mapping league rankings to the player dataset.
+# ---------------------------------------------
+
+Part(v)(b)
+```{r}
+
+library(dplyr)
+library(readr)
+
+# Read your ranking file
+league_rankings <- read_csv("league_rankings_2022_corrected.csv")
+
+
+players_data <- players_data %>%
+  left_join(league_rankings %>% dplyr::select(Pos, Unique_Leagues),
+            by = c("League_Name" = "Unique_Leagues")) %>%
+  mutate(League_Ranking = if_else(is.na(Pos), 67, Pos))
+
+players_data <- dplyr::select(players_data, -Pos)
+
+# Check the result
+head(players_data)
+
+
+
+```
+
+
+## Preffered Foot
+Part(vi)
+```{r}
+# Convert Preferred_Foot to numeric: 0 = Left, 1 = Right
+players_data$Preferred_Foot <- ifelse(players_data$Preferred_Foot == "Left", 0,
+                                  ifelse(players_data$Preferred_Foot == "Right", 1, NA))
+
+# Check
+table(players_data$Preferred_Foot)
+
+
+```
+
+## Contract Length
+Part(vii)
+
+```{r}
+
+players_data$Contract_Years_Remained <- players_data$Contract_Valid_Until - 2021
+  
+```
+
+## Keep only the columns that we need
+```{r}
+
+players_data <- subset(players_data, select = -c(Club_Name, League_Name, Club_Joined, Contract_Valid_Until, Club_Position, Nation_Position, Weak_Foot, Work_Rate, International_Reputation, Weight_kg))
+
+# Remove rows with any NA values
+players_data <- na.omit(players_data)
+
+write.csv(players_data, "players_data.csv", row.names = FALSE)
+
+names(players_data)
+
+
+```
+
+
+## We add another dataset for more data (More parameters)
+
+## Make into a readable form
+```{r}
+# Read file as raw text
+txt <- readLines("2021-2022 Football Player Stats.csv",
+                 encoding = "UTF-8")
+
+# Write clean version
+writeLines(txt, "2021-2022 Football Player Stats CLEAN.csv",
+           useBytes = TRUE)
+
+# Read cleaned file as semicolon-delimited CSV
+df <- read.csv("2021-2022 Football Player Stats CLEAN.csv",
+               sep = ";",
+               encoding = "UTF-8")
+
+write.csv(df, "Stats.csv", row.names = FALSE)
+
+
+```
+
+
+### Correct and improve language clarity
+
+```{r}
+names(df)
+
+
+# Keep the necessary columns
+df = df[, c(
+  "Player", "Pos", "Squad", "Min", "Goals", "PasTotCmp.", "Assists", "Tkl.Int", "Clr", "Err", "Recov"
+)]
+
+
+# Rename the columns
+names(df) <- c(
+  "Name",
+  "Position",
+  "Team",
+  "Minutes_Played",
+  "Goals",
+  "Total_Passes_Completed_Perc",
+  "Assists",
+  "Tackles_Interceptions",
+  "Clearances",
+  "Errors",
+  "Recoveries"
+)
+
+df$Name <- iconv(df$Name, from = "latin1", to = "UTF-8")
+library(stringi)
+
+df$Name <- stringi::stri_trans_nfc(df$Name)
+players_data$Name <- stringi::stri_trans_nfc(players_data$Name)
+
+# Normalize the Name column to NFC (composed) form
+df$Name <- stri_trans_nfc(df$Name)
+players_data$Name <- stri_trans_nfc(players_data$Name)
+
+
+
+```
+
+
+
+# Ensure both datasets use the same naming format
+#(a)
+```{r}
+library(dplyr)
+library(stringr)
+
+df <- df |>
+  mutate(
+    Name = Name |>
+      str_replace_all("\\?", "") |>
+      str_squish() |>
+      sapply(function(n) {
+        parts <- str_split(n, " +", simplify = TRUE)
+
+        if (length(parts) == 1) {
+          # Only one name -> keep it as is
+          return(parts[1])
+        }
+
+        surname <- parts[1]
+        rest    <- paste(parts[-1], collapse = " ")
+        paste0(substr(surname, 1, 1), ". ", rest)
+      })
+  ) |>
+  group_by(Name) |>
+  slice_max(order_by = Minutes_Played, n = 1) |>   # THIS is the correct column name
+  ungroup() |>
+  filter(Minutes_Played >= 90)
+
+
+
+```
+
+#(b)
+```{r}
+library(dplyr)
+library(stringr)
+library(stringi)
+
+# Suffixes, now optional dot
+suffixes <- c("Jr\\.?","Sr\\.?")
+
+players_data <- players_data %>%
+  mutate(
+    Name = Name %>%
+      str_replace_all("\\?", "") %>%      # remove question marks
+      str_squish() %>%                    # trim extra spaces
+      str_remove_all(paste0("\\b(", paste(suffixes, collapse="|"), ")\\b")) %>% # remove Jr, Sr, etc.
+      str_squish() %>%
+      stri_trans_nfc() %>%                # normalize accents
+      sapply(function(n) {
+        parts <- str_split(n, " +", simplify = TRUE)
+        if(length(parts) == 1) {
+          # Single-word name, keep as is
+          return(parts)
+        } else {
+          # First initial + rest
+          first <- substr(parts[1], 1, 1)
+          rest  <- paste(parts[-1], collapse = " ")
+          paste0(first, ". ", rest)
+        }
+      })
+  )
+
+
+```
+
+# Join the two datasets by the column Name
+# This is the final dataset
+```{r}
+library(dplyr)
+
+final <- df %>%
+  inner_join(players_data, by = "Name")
+
+names(final)
+#stop("Stopping here because you told me to.")
+```
+
+# Modify the columns and save the final dataframe
+```{r}
+final <- subset(final, select = -c(Name, Position, Team))
+
+# Remove rows with any NA values
+final <- na.omit(final)
+
+write.csv(final, "players_data.csv", row.names = FALSE)
+
+names(final)
+
+#stop("Stopping here because you told me to.")
+
+```
+
+
+# ---------------------------------------------
+# ---------------------------------------------
+# ---------------------------------------------
+
+## Second Chapter
+## Linear Model
+
+
+```{r}
+
+rm(list = ls()) #clean memory
+
+players_data = read.csv("players_data.csv")
+
+players_data$Value_EUR <- players_data$Value_EUR / 1e6
+
+players_data$Release_Clause_EUR <- players_data$Release_Clause_EUR / 1e6
+
+# Sort by Value_EUR
+players_data <- players_data[order(players_data$Value_EUR), ]
+
+
+players_data <- subset(players_data, select = -c(Release_Clause_EUR, League_Ranking, Preferred_Foot, Errors, Height_cm, Continent))
+
+library(dplyr)
+
+# Keep only players with at least 450 minutes
+players_data <- players_data %>%
+  filter(Minutes_Played >= 450)
+
+# Keep only players with a value of at least 5 million
+players_data <- players_data %>%
+  filter(Value_EUR >= 5)
+
+
+names(players_data)
+
+```
+# Correlations
+```{r}
+
+# Identify numeric columns except Value_EUR
+numeric_cols <- names(players_data)[sapply(players_data, is.numeric)]
+numeric_cols <- setdiff(numeric_cols, "Value_EUR")
+
+# Loop over numeric columns and compute correlation
+for(col in numeric_cols) {
+  corr_value <- cor(players_data$Value_EUR, players_data[[col]], use = "complete.obs")
+  cat("Correlation between Value_EUR and", col, "=", round(corr_value, 3), "\n")
+}
+```
+
+
+
+
+## Part(i)
+```{r}
+
+fit <- lm(Value_EUR ~ ., data = players_data)
+Yhat <- fit$fitted.values
+
+summary(fit)
+
+```
+
+# for loop
+```{r}
+# Loop through all predictor columns
+predictors <- names(players_data)
+predictors <- predictors[predictors != "Value_EUR"]  # exclude dependent variable
+
+for (col in predictors) {
+  # Scatter plot
+  plot(players_data[[col]], players_data$Value_EUR,
+       main = paste("Value_EUR vs", col),
+       xlab = col, ylab = "Value_EUR",
+       pch = 19, col = "gray")
+  
+  dataset = players_data[[col]]
+  sorted_idx <- order(dataset)
+  x_sorted <- dataset[sorted_idx]
+  yhat_sorted <- Yhat[sorted_idx]
+ 
+  lines(x_sorted, yhat_sorted, col = 2, lwd = 2)  # lwd=2 makes the line thicker
+  
+  # Fit simple linear model
+  model <- lm(Value_EUR ~ ., data = players_data[, c("Value_EUR", col)])
+  
+  # Add regression line
+  sorted_idx <- order(players_data[[col]])
+  x_sorted <- players_data[[col]][sorted_idx]
+  yhat_sorted <- model$fitted.values[sorted_idx]
+  lines(x_sorted, yhat_sorted, col = "blue", lwd = 2)
+}
+
+
+
+```
+
+#####
+##### Check literature , pws douleuei to fit stin R (An dinei varitita apo mono tou se kapoio variable)
+
+
+```{r}
+plot(players_data$Value_EUR, Yhat)
+abline(0,1) 
+
+```
+
+
+
+
+### Errors
+
+```{r}
+names(fit)
+errors=fit$res
+qqnorm(errors)
+qqline(errors)
+
+```
+
+Tests for uncorrelated errors with constant variance
+```{r}
+plot(fit$fitted.values, errors) # den yparhei motivo, fainetai statheri diakymansi
+```
+
+Tests for suitability of linear model
+```{r}
+# Loop through all predictor columns
+predictors <- names(players_data)
+predictors <- predictors[predictors != "Value_EUR"]  # exclude dependent variable
+
+for (col in predictors) {
+  plot(players_data[[col]], errors,
+     main = paste("Errors of", col),
+     xlab = col, ylab = "Errors",
+     pch = 19, col = "gray")
+}
+
+```
+
+### Prediction
+
+# Haaland Prediction
+```{r}
+names(players_data)
+
+# All the stats are per minute
+newdata <- data.frame(
+  Minutes_Played = 2400,              # total minutes played
+  Goals = 1,                         # number of goals
+  Total_Passes_Completed_Perc = 75,   # percentage
+  Assists = 0.3,                        # number of assists
+  Tackles_Interceptions = 0,         # combined tackles + interceptions
+  Clearances = 0,
+  Recoveries = 1,                     # recoveries
+  Player_Positions = 4,      
+  Age = 21,                           # numeric encoding of position
+  Wage_EUR = 170000,                    # weekly wage
+  Nationality = 43,                       # numeric encoding
+  Club_Ranking = 19,                     # e.g., league table ranking
+  Contract_Years_Remained = 3           # remaining years
+)
+
+
+predict(fit,newdata,interval="conf", level=0.95) #95% diastima empistosynis gia to Y
+
+# 
+predict(fit,newdata, interval="pred",level=0.95) #95% diastima provlepsis gia to Y
+
+
+```
+
+
+```{r}
+
+newdata <- data.frame(
+  Minutes_Played = 2000,
+  Goals = 0.3,                       
+  Total_Passes_Completed_Perc = 0.91,   
+  Assists = 0.5,                       
+  Tackles_Interceptions = 4,         
+  Clearances = 0,                    
+  Recoveries = 2,                    
+  Player_Positions = 3,               
+  Age = 18,                          
+  Wage_EUR = 50000,               
+  Nationality = 3,                  
+  Club_Ranking = 5,                  
+  Contract_Years_Remained = 7        
+)
+
+predict(fit,newdata,interval="conf", level=0.95) #95% diastima empistosynis gia to Y
+
+# 
+predict(fit,newdata, interval="pred",level=0.95) #95% diastima provlepsis gia to Y
+  
+```
+
+#Lamine Yamal's Prediction
+```{r}
+
+newdata <- data.frame(
+  Minutes_Played = 4368,              
+  Goals = 0.37,                        
+  Total_Passes_Completed_Perc = 82,     
+  Assists = 0.52,                      
+  Tackles_Interceptions = 1,         
+  Clearances = 0,                   
+  Recoveries = 1,                     
+  Player_Positions = 4,                
+  Age = 18,                         
+  Wage_EUR = 270540,               
+  Nationality = 1,       
+  Club_Ranking = 4,                 
+  Contract_Years_Remained = 6        
+)
+
+
+predict(fit,newdata,interval="conf", level=0.95) #95% diastima empistosynis gia to Y
+
+predict(fit,newdata, interval="pred",level=0.95) #95% diastima provlepsis gia to Y
+
+```
